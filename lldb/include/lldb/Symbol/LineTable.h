@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef liblldb_LineTable_h_
-#define liblldb_LineTable_h_
+#ifndef LLDB_SYMBOL_LINETABLE_H
+#define LLDB_SYMBOL_LINETABLE_H
 
 #include "lldb/Core/ModuleChild.h"
 #include "lldb/Core/Section.h"
@@ -29,7 +29,8 @@ public:
   virtual void Clear() = 0;
 
 private:
-  DISALLOW_COPY_AND_ASSIGN(LineSequence);
+  LineSequence(const LineSequence &) = delete;
+  const LineSequence &operator=(const LineSequence &) = delete;
 };
 
 /// \class LineTable LineTable.h "lldb/Symbol/LineTable.h"
@@ -46,7 +47,8 @@ public:
   ///
   /// \param[in] sequences
   ///     Unsorted list of line sequences.
-  LineTable(CompileUnit *comp_unit, std::vector<LineSequence *> &sequences);
+  LineTable(CompileUnit *comp_unit,
+            std::vector<std::unique_ptr<LineSequence>> &&sequences);
 
   /// Destructor.
   ~LineTable();
@@ -70,7 +72,7 @@ public:
                        bool is_epilogue_begin, bool is_terminal_entry);
 
   // Used to instantiate the LineSequence helper class
-  static LineSequence *CreateLineSequenceContainer();
+  static std::unique_ptr<LineSequence> CreateLineSequenceContainer();
 
   // Append an entry to a caller-provided collection that will later be
   // inserted in this line table.
@@ -182,7 +184,7 @@ public:
   ///     The number of line table entries in this line table.
   uint32_t GetSize() const;
 
-  typedef lldb_private::RangeArray<lldb::addr_t, lldb::addr_t, 32>
+  typedef lldb_private::RangeVector<lldb::addr_t, lldb::addr_t, 32>
       FileAddressRanges;
 
   /// Gets all contiguous file address ranges for the entire line table.
@@ -265,7 +267,8 @@ protected:
     public:
       LessThanBinaryPredicate(LineTable *line_table);
       bool operator()(const LineTable::Entry &, const LineTable::Entry &) const;
-      bool operator()(const LineSequence*, const LineSequence*) const;
+      bool operator()(const std::unique_ptr<LineSequence> &,
+                      const std::unique_ptr<LineSequence> &) const;
 
     protected:
       LineTable *m_line_table;
@@ -335,9 +338,10 @@ protected:
   bool ConvertEntryAtIndexToLineEntry(uint32_t idx, LineEntry &line_entry);
 
 private:
-  DISALLOW_COPY_AND_ASSIGN(LineTable);
+  LineTable(const LineTable &) = delete;
+  const LineTable &operator=(const LineTable &) = delete;
 };
 
 } // namespace lldb_private
 
-#endif // liblldb_LineTable_h_
+#endif // LLDB_SYMBOL_LINETABLE_H

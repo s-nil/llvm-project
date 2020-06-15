@@ -28,21 +28,47 @@
 using namespace clang;
 using namespace sema;
 
-bool
-Sema::CheckConstraintExpression(Expr *ConstraintExpression, Token NextToken,
-                                bool *PossibleNonPrimary,
-                                bool IsTrailingRequiresClause) {
+namespace {
+class LogicalBinOp {
+  OverloadedOperatorKind Op = OO_None;
+  const Expr *LHS = nullptr;
+  const Expr *RHS = nullptr;
+
+public:
+  LogicalBinOp(const Expr *E) {
+    if (auto *BO = dyn_cast<BinaryOperator>(E)) {
+      Op = BinaryOperator::getOverloadedOperator(BO->getOpcode());
+      LHS = BO->getLHS();
+      RHS = BO->getRHS();
+    } else if (auto *OO = dyn_cast<CXXOperatorCallExpr>(E)) {
+      Op = OO->getOperator();
+      LHS = OO->getArg(0);
+      RHS = OO->getArg(1);
+    }
+  }
+
+  bool isAnd() const { return Op == OO_AmpAmp; }
+  bool isOr() const { return Op == OO_PipePipe; }
+  explicit operator bool() const { return isAnd() || isOr(); }
+
+  const Expr *getLHS() const { return LHS; }
+  const Expr *getRHS() const { return RHS; }
+};
+}
+
+bool Sema::CheckConstraintExpression(const Expr *ConstraintExpression,
+                                     Token NextToken, bool *PossibleNonPrimary,
+                                     bool IsTrailingRequiresClause) {
   // C++2a [temp.constr.atomic]p1
   // ..E shall be a constant expression of type bool.
 
   ConstraintExpression = ConstraintExpression->IgnoreParenImpCasts();
 
-  if (auto *BinOp = dyn_cast<BinaryOperator>(ConstraintExpression)) {
-    if (BinOp->getOpcode() == BO_LAnd || BinOp->getOpcode() == BO_LOr)
-      return CheckConstraintExpression(BinOp->getLHS(), NextToken,
-                                       PossibleNonPrimary) &&
-             CheckConstraintExpression(BinOp->getRHS(), NextToken,
-                                       PossibleNonPrimary);
+  if (LogicalBinOp BO = ConstraintExpression) {
+    return CheckConstraintExpression(BO.getLHS(), NextToken,
+                                     PossibleNonPrimary) &&
+           CheckConstraintExpression(BO.getRHS(), NextToken,
+                                     PossibleNonPrimary);
   } else if (auto *C = dyn_cast<ExprWithCleanups>(ConstraintExpression))
     return CheckConstraintExpression(C->getSubExpr(), NextToken,
                                      PossibleNonPrimary);
@@ -60,7 +86,7 @@ Sema::CheckConstraintExpression(Expr *ConstraintExpression, Token NextToken,
           (NextToken.is(tok::l_paren) &&
            (IsTrailingRequiresClause ||
             (Type->isDependentType() &&
-             IsDependentFunctionNameExpr(ConstraintExpression)) ||
+             isa<UnresolvedLookupExpr>(ConstraintExpression)) ||
             Type->isFunctionType() ||
             Type->isSpecificBuiltinType(BuiltinType::Overload))) ||
           // We have the following case:
@@ -99,39 +125,37 @@ calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
                                 AtomicEvaluator &&Evaluator) {
   ConstraintExpr = ConstraintExpr->IgnoreParenImpCasts();
 
-  if (auto *BO = dyn_cast<BinaryOperator>(ConstraintExpr)) {
-    if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
-      if (calculateConstraintSatisfaction(S, BO->getLHS(), Satisfaction,
-                                          Evaluator))
-        return true;
+  if (LogicalBinOp BO = ConstraintExpr) {
+    if (calculateConstraintSatisfaction(S, BO.getLHS(), Satisfaction,
+                                        Evaluator))
+      return true;
 
-      bool IsLHSSatisfied = Satisfaction.IsSatisfied;
+    bool IsLHSSatisfied = Satisfaction.IsSatisfied;
 
-      if (BO->getOpcode() == BO_LOr && IsLHSSatisfied)
-        // [temp.constr.op] p3
-        //    A disjunction is a constraint taking two operands. To determine if
-        //    a disjunction is satisfied, the satisfaction of the first operand
-        //    is checked. If that is satisfied, the disjunction is satisfied.
-        //    Otherwise, the disjunction is satisfied if and only if the second
-        //    operand is satisfied.
-        return false;
+    if (BO.isOr() && IsLHSSatisfied)
+      // [temp.constr.op] p3
+      //    A disjunction is a constraint taking two operands. To determine if
+      //    a disjunction is satisfied, the satisfaction of the first operand
+      //    is checked. If that is satisfied, the disjunction is satisfied.
+      //    Otherwise, the disjunction is satisfied if and only if the second
+      //    operand is satisfied.
+      return false;
 
-      if (BO->getOpcode() == BO_LAnd && !IsLHSSatisfied)
-        // [temp.constr.op] p2
-        //    A conjunction is a constraint taking two operands. To determine if
-        //    a conjunction is satisfied, the satisfaction of the first operand
-        //    is checked. If that is not satisfied, the conjunction is not
-        //    satisfied. Otherwise, the conjunction is satisfied if and only if
-        //    the second operand is satisfied.
-        return false;
+    if (BO.isAnd() && !IsLHSSatisfied)
+      // [temp.constr.op] p2
+      //    A conjunction is a constraint taking two operands. To determine if
+      //    a conjunction is satisfied, the satisfaction of the first operand
+      //    is checked. If that is not satisfied, the conjunction is not
+      //    satisfied. Otherwise, the conjunction is satisfied if and only if
+      //    the second operand is satisfied.
+      return false;
 
-      return calculateConstraintSatisfaction(S, BO->getRHS(), Satisfaction,
-          std::forward<AtomicEvaluator>(Evaluator));
-    }
-  }
-  else if (auto *C = dyn_cast<ExprWithCleanups>(ConstraintExpr))
+    return calculateConstraintSatisfaction(
+        S, BO.getRHS(), Satisfaction, std::forward<AtomicEvaluator>(Evaluator));
+  } else if (auto *C = dyn_cast<ExprWithCleanups>(ConstraintExpr)) {
     return calculateConstraintSatisfaction(S, C->getSubExpr(), Satisfaction,
         std::forward<AtomicEvaluator>(Evaluator));
+  }
 
   // An atomic constraint expression
   ExprResult SubstitutedAtomicExpr = Evaluator(ConstraintExpr);
@@ -167,9 +191,8 @@ calculateConstraintSatisfaction(Sema &S, const Expr *ConstraintExpr,
   return false;
 }
 
-template <typename TemplateDeclT>
 static bool calculateConstraintSatisfaction(
-    Sema &S, TemplateDeclT *Template, ArrayRef<TemplateArgument> TemplateArgs,
+    Sema &S, const NamedDecl *Template, ArrayRef<TemplateArgument> TemplateArgs,
     SourceLocation TemplateNameLoc, MultiLevelTemplateArgumentList &MLTAL,
     const Expr *ConstraintExpr, ConstraintSatisfaction &Satisfaction) {
   return calculateConstraintSatisfaction(
@@ -182,8 +205,9 @@ static bool calculateConstraintSatisfaction(
         {
           TemplateDeductionInfo Info(TemplateNameLoc);
           Sema::InstantiatingTemplate Inst(S, AtomicExpr->getBeginLoc(),
-              Sema::InstantiatingTemplate::ConstraintSubstitution{}, Template,
-              Info, AtomicExpr->getSourceRange());
+              Sema::InstantiatingTemplate::ConstraintSubstitution{},
+              const_cast<NamedDecl *>(Template), Info,
+              AtomicExpr->getSourceRange());
           if (Inst.isInvalid())
             return ExprError();
           // We do not want error diagnostics escaping here.
@@ -230,8 +254,7 @@ static bool calculateConstraintSatisfaction(
       });
 }
 
-template<typename TemplateDeclT>
-static bool CheckConstraintSatisfaction(Sema &S, TemplateDeclT *Template,
+static bool CheckConstraintSatisfaction(Sema &S, const NamedDecl *Template,
                                         ArrayRef<const Expr *> ConstraintExprs,
                                         ArrayRef<TemplateArgument> TemplateArgs,
                                         SourceRange TemplateIDRange,
@@ -249,8 +272,8 @@ static bool CheckConstraintSatisfaction(Sema &S, TemplateDeclT *Template,
     }
 
   Sema::InstantiatingTemplate Inst(S, TemplateIDRange.getBegin(),
-      Sema::InstantiatingTemplate::ConstraintsCheck{}, Template, TemplateArgs,
-      TemplateIDRange);
+      Sema::InstantiatingTemplate::ConstraintsCheck{},
+      const_cast<NamedDecl *>(Template), TemplateArgs, TemplateIDRange);
   if (Inst.isInvalid())
     return true;
 
@@ -272,36 +295,45 @@ static bool CheckConstraintSatisfaction(Sema &S, TemplateDeclT *Template,
   return false;
 }
 
-bool Sema::CheckConstraintSatisfaction(TemplateDecl *Template,
-                                       ArrayRef<const Expr *> ConstraintExprs,
-                                       ArrayRef<TemplateArgument> TemplateArgs,
-                                       SourceRange TemplateIDRange,
-                                       ConstraintSatisfaction &Satisfaction) {
-  return ::CheckConstraintSatisfaction(*this, Template, ConstraintExprs,
-                                       TemplateArgs, TemplateIDRange,
-                                       Satisfaction);
-}
+bool Sema::CheckConstraintSatisfaction(
+    const NamedDecl *Template, ArrayRef<const Expr *> ConstraintExprs,
+    ArrayRef<TemplateArgument> TemplateArgs, SourceRange TemplateIDRange,
+    ConstraintSatisfaction &OutSatisfaction) {
+  if (ConstraintExprs.empty()) {
+    OutSatisfaction.IsSatisfied = true;
+    return false;
+  }
 
-bool
-Sema::CheckConstraintSatisfaction(ClassTemplatePartialSpecializationDecl* Part,
-                                  ArrayRef<const Expr *> ConstraintExprs,
-                                  ArrayRef<TemplateArgument> TemplateArgs,
-                                  SourceRange TemplateIDRange,
-                                  ConstraintSatisfaction &Satisfaction) {
-  return ::CheckConstraintSatisfaction(*this, Part, ConstraintExprs,
-                                       TemplateArgs, TemplateIDRange,
-                                       Satisfaction);
-}
+  llvm::FoldingSetNodeID ID;
+  void *InsertPos;
+  ConstraintSatisfaction *Satisfaction = nullptr;
+  bool ShouldCache = LangOpts.ConceptSatisfactionCaching && Template;
+  if (ShouldCache) {
+    ConstraintSatisfaction::Profile(ID, Context, Template, TemplateArgs);
+    Satisfaction = SatisfactionCache.FindNodeOrInsertPos(ID, InsertPos);
+    if (Satisfaction) {
+      OutSatisfaction = *Satisfaction;
+      return false;
+    }
+    Satisfaction = new ConstraintSatisfaction(Template, TemplateArgs);
+  } else {
+    Satisfaction = &OutSatisfaction;
+  }
+  if (::CheckConstraintSatisfaction(*this, Template, ConstraintExprs,
+                                    TemplateArgs, TemplateIDRange,
+                                    *Satisfaction)) {
+    if (ShouldCache)
+      delete Satisfaction;
+    return true;
+  }
 
-bool
-Sema::CheckConstraintSatisfaction(VarTemplatePartialSpecializationDecl* Partial,
-                                  ArrayRef<const Expr *> ConstraintExprs,
-                                  ArrayRef<TemplateArgument> TemplateArgs,
-                                  SourceRange TemplateIDRange,
-                                  ConstraintSatisfaction &Satisfaction) {
-  return ::CheckConstraintSatisfaction(*this, Partial, ConstraintExprs,
-                                       TemplateArgs, TemplateIDRange,
-                                       Satisfaction);
+  if (ShouldCache) {
+    // We cannot use InsertNode here because CheckConstraintSatisfaction might
+    // have invalidated it.
+    SatisfactionCache.InsertNode(Satisfaction);
+    OutSatisfaction = *Satisfaction;
+  }
+  return false;
 }
 
 bool Sema::CheckConstraintSatisfaction(const Expr *ConstraintExpr,
@@ -311,6 +343,30 @@ bool Sema::CheckConstraintSatisfaction(const Expr *ConstraintExpr,
       [](const Expr *AtomicExpr) -> ExprResult {
         return ExprResult(const_cast<Expr *>(AtomicExpr));
       });
+}
+
+bool Sema::CheckFunctionConstraints(const FunctionDecl *FD,
+                                    ConstraintSatisfaction &Satisfaction,
+                                    SourceLocation UsageLoc) {
+  const Expr *RC = FD->getTrailingRequiresClause();
+  if (RC->isInstantiationDependent()) {
+    Satisfaction.IsSatisfied = true;
+    return false;
+  }
+  Qualifiers ThisQuals;
+  CXXRecordDecl *Record = nullptr;
+  if (auto *Method = dyn_cast<CXXMethodDecl>(FD)) {
+    ThisQuals = Method->getMethodQualifiers();
+    Record = const_cast<CXXRecordDecl *>(Method->getParent());
+  }
+  CXXThisScopeRAII ThisScope(*this, Record, ThisQuals, Record != nullptr);
+  // We substitute with empty arguments in order to rebuild the atomic
+  // constraint in a constant-evaluated context.
+  // FIXME: Should this be a dedicated TreeTransform?
+  return CheckConstraintSatisfaction(
+      FD, {RC}, /*TemplateArgs=*/{},
+      SourceRange(UsageLoc.isValid() ? UsageLoc : FD->getLocation()),
+      Satisfaction);
 }
 
 bool Sema::EnsureTemplateArgumentListConstraints(
@@ -651,6 +707,10 @@ static bool substituteParameterMappings(Sema &S, NormalizedConstraint &N,
                   ArgsAsWritten->arguments().back().getSourceRange().getEnd()));
   if (S.SubstTemplateArguments(*Atomic.ParameterMapping, MLTAL, SubstArgs))
     return true;
+  Atomic.ParameterMapping.emplace(
+        MutableArrayRef<TemplateArgumentLoc>(
+            new (S.Context) TemplateArgumentLoc[SubstArgs.size()],
+            SubstArgs.size()));
   std::copy(SubstArgs.arguments().begin(), SubstArgs.arguments().end(),
             N.getAtomicConstraint()->ParameterMapping->begin());
   return false;
@@ -689,19 +749,16 @@ NormalizedConstraint::fromConstraintExpr(Sema &S, NamedDecl *D, const Expr *E) {
   // - The normal form of an expression (E) is the normal form of E.
   // [...]
   E = E->IgnoreParenImpCasts();
-  if (auto *BO = dyn_cast<const BinaryOperator>(E)) {
-    if (BO->getOpcode() == BO_LAnd || BO->getOpcode() == BO_LOr) {
-      auto LHS = fromConstraintExpr(S, D, BO->getLHS());
-      if (!LHS)
-        return None;
-      auto RHS = fromConstraintExpr(S, D, BO->getRHS());
-      if (!RHS)
-        return None;
+  if (LogicalBinOp BO = E) {
+    auto LHS = fromConstraintExpr(S, D, BO.getLHS());
+    if (!LHS)
+      return None;
+    auto RHS = fromConstraintExpr(S, D, BO.getRHS());
+    if (!RHS)
+      return None;
 
-      return NormalizedConstraint(
-          S.Context, std::move(*LHS), std::move(*RHS),
-          BO->getOpcode() == BO_LAnd ? CCK_Conjunction : CCK_Disjunction);
-    }
+    return NormalizedConstraint(S.Context, std::move(*LHS), std::move(*RHS),
+                                BO.isAnd() ? CCK_Conjunction : CCK_Disjunction);
   } else if (auto *CSE = dyn_cast<const ConceptSpecializationExpr>(E)) {
     const NormalizedConstraint *SubNF;
     {

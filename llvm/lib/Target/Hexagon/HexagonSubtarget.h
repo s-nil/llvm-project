@@ -87,8 +87,14 @@ public:
   };
 
 private:
+  enum HexagonProcFamilyEnum { Others, TinyCore };
+
   std::string CPUString;
   Triple TargetTriple;
+
+  // The following objects can use the TargetTriple, so they must be
+  // declared after it.
+  HexagonProcFamilyEnum HexagonProcFamily = Others;
   HexagonInstrInfo InstrInfo;
   HexagonRegisterInfo RegInfo;
   HexagonTargetLowering TLInfo;
@@ -185,6 +191,9 @@ public:
   bool useUnsafeMath() const { return UseUnsafeMath; }
   bool useZRegOps() const { return UseZRegOps; }
 
+  bool isTinyCore() const { return HexagonProcFamily == TinyCore; }
+  bool isTinyCoreWithDuplex() const { return isTinyCore() && EnableDuplex; }
+
   bool useHVXOps() const {
     return HexagonHVXVersion > Hexagon::ArchEnum::NoArch;
   }
@@ -249,7 +258,8 @@ public:
 
   /// Perform target specific adjustments to the latency of a schedule
   /// dependency.
-  void adjustSchedDependency(SUnit *def, SUnit *use, SDep& dep) const override;
+  void adjustSchedDependency(SUnit *Def, int DefOpIdx, SUnit *Use, int UseOpIdx,
+                             SDep &Dep) const override;
 
   unsigned getVectorLength() const {
     assert(useHVXOps());
@@ -277,9 +287,6 @@ public:
     ArrayRef<MVT> ElemTypes = getHVXElementTypes();
 
     if (IncludeBool && ElemTy == MVT::i1) {
-      // Special case for the v512i1, etc.
-      if (8*HwLen == NumElems)
-        return true;
       // Boolean HVX vector types are formed from regular HVX vector types
       // by replacing the element type with i1.
       for (MVT T : ElemTypes)

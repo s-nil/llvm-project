@@ -1,4 +1,4 @@
-//===-- TestObjectFileELF.cpp -----------------------------------*- C++ -*-===//
+//===-- TestObjectFileELF.cpp ---------------------------------------------===//
 //
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -156,7 +156,7 @@ TEST_F(ObjectFileELFTest, GetModuleSpecifications_EarlySectionHeaders) {
   ModuleSpec Spec;
   ASSERT_TRUE(Specs.GetModuleSpecAtIndex(0, Spec)) ;
   UUID Uuid;
-  Uuid.SetFromStringRef("1b8a73ac238390e32a7ff4ac8ebe4d6a41ecf5c9", 20);
+  Uuid.SetFromStringRef("1b8a73ac238390e32a7ff4ac8ebe4d6a41ecf5c9");
   EXPECT_EQ(Spec.GetUUID(), Uuid);
 }
 

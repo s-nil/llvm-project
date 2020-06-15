@@ -1,4 +1,4 @@
-//===-- ProcessMinidump.cpp -------------------------------------*- C++ -*-===//
+//===-- ProcessMinidump.cpp -----------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -40,6 +40,8 @@
 using namespace lldb;
 using namespace lldb_private;
 using namespace minidump;
+
+LLDB_PLUGIN_DEFINE(ProcessMinidump)
 
 namespace {
 
@@ -255,7 +257,7 @@ void ProcessMinidump::RefreshStateAfterStop() {
 
     // TODO: The definition and use of this "dump requested" constant
     // in Breakpad are actually Linux-specific, and for similar use
-    // cases on Mac/Windows it defines differnt constants, referring
+    // cases on Mac/Windows it defines different constants, referring
     // to them as "simulated" exceptions; consider moving this check
     // down to the OS-specific paths and checking each OS for its own
     // constant.

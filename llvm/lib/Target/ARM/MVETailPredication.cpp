@@ -1,4 +1,4 @@
-//===- MVETailPredication.cpp - MVE Tail Predication ----------------------===//
+//===- MVETailPredication.cpp - MVE Tail Predication ------------*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -8,8 +8,17 @@
 //
 /// \file
 /// Armv8.1m introduced MVE, M-Profile Vector Extension, and low-overhead
-/// branches to help accelerate DSP applications. These two extensions can be
-/// combined to provide implicit vector predication within a low-overhead loop.
+/// branches to help accelerate DSP applications. These two extensions,
+/// combined with a new form of predication called tail-predication, can be used
+/// to provide implicit vector predication within a low-overhead loop.
+/// This is implicit because the predicate of active/inactive lanes is
+/// calculated by hardware, and thus does not need to be explicitly passed
+/// to vector instructions. The instructions responsible for this are the
+/// DLSTP and WLSTP instructions, which setup a tail-predicated loop and the
+/// the total number of data elements processed by the loop. The loop-end
+/// LETP instruction is responsible for decrementing and setting the remaining
+/// elements to be processed and generating the mask of active lanes.
+///
 /// The HardwareLoops pass inserts intrinsics identifying loops that the
 /// backend will attempt to convert into a low-overhead loop. The vectorizer is
 /// responsible for generating a vectorized loop in which the lanes are
@@ -21,28 +30,34 @@
 /// - A loop containing multiple VCPT instructions, predicating multiple VPT
 ///   blocks of instructions operating on different vector types.
 ///
-/// This pass inserts the inserts the VCTP intrinsic to represent the effect of
-/// tail predication. This will be picked up by the ARM Low-overhead loop pass,
-/// which performs the final transformation to a DLSTP or WLSTP tail-predicated
-/// loop.
+/// This pass:
+/// 1) Pattern matches the scalar iteration count produced by the vectoriser.
+///    The scalar loop iteration count represents the number of elements to be
+///    processed.
+///    TODO: this could be emitted using an intrinsic, similar to the hardware
+///    loop intrinsics, so that we don't need to pattern match this here.
+/// 2) Inserts the VCTP intrinsic to represent the effect of
+///    tail predication. This will be picked up by the ARM Low-overhead loop
+///    pass, which performs the final transformation to a DLSTP or WLSTP
+///    tail-predicated loop.
 
 #include "ARM.h"
 #include "ARMSubtarget.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/Analysis/ScalarEvolutionExpander.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
-#include "llvm/InitializePasses.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsARM.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 using namespace llvm;
 
@@ -54,6 +69,28 @@ DisableTailPredication("disable-mve-tail-predication", cl::Hidden,
                        cl::init(true),
                        cl::desc("Disable MVE Tail Predication"));
 namespace {
+
+// Bookkeeping for pattern matching the loop trip count and the number of
+// elements processed by the loop.
+struct TripCountPattern {
+  // An icmp instruction that calculates a predicate of active/inactive lanes
+  // used by the masked loads/stores.
+  Instruction *Predicate = nullptr;
+
+  // The add instruction that increments the IV.
+  Value *TripCount = nullptr;
+
+  // The number of elements processed by the vector loop.
+  Value *NumElements = nullptr;
+
+  // Other instructions in the icmp chain that calculate the predicate.
+  FixedVectorType *VecTy = nullptr;
+  Instruction *Shuffle = nullptr;
+  Instruction *Induction = nullptr;
+
+  TripCountPattern(Instruction *P, Value *TC, FixedVectorType *VT)
+      : Predicate(P), TripCount(TC), VecTy(VT){};
+};
 
 class MVETailPredication : public LoopPass {
   SmallVector<IntrinsicInst*, 4> MaskedInsts;
@@ -85,7 +122,6 @@ public:
   bool runOnLoop(Loop *L, LPPassManager&) override;
 
 private:
-
   /// Perform the relevant checks on the loop and convert if possible.
   bool TryConvert(Value *TripCount);
 
@@ -94,18 +130,17 @@ private:
   bool IsPredicatedVectorLoop();
 
   /// Compute a value for the total number of elements that the predicated
-  /// loop will process.
-  Value *ComputeElements(Value *TripCount, VectorType *VecTy);
+  /// loop will process if it is a runtime value.
+  bool ComputeRuntimeElements(TripCountPattern &TCP);
 
-  /// Is the icmp that generates an i1 vector, based upon a loop counter
-  /// and a limit that is defined outside the loop.
-  bool isTailPredicate(Instruction *Predicate, Value *NumElements);
+  /// Return whether this is the icmp that generates an i1 vector, based
+  /// upon a loop counter and a limit that is defined outside the loop,
+  /// that generates the active/inactive lanes required for tail-predication.
+  bool isTailPredicate(TripCountPattern &TCP);
 
   /// Insert the intrinsic to represent the effect of tail predication.
-  void InsertVCTPIntrinsic(Instruction *Predicate,
-                           DenseMap<Instruction*, Instruction*> &NewPredicates,
-                           VectorType *VecTy,
-                           Value *NumElements);
+  void InsertVCTPIntrinsic(TripCountPattern &TCP,
+                           DenseMap<Instruction *, Instruction *> &NewPredicates);
 
   /// Rematerialize the iteration count in exit blocks, which enables
   /// ARMLowOverheadLoops to better optimise away loop update statements inside
@@ -140,7 +175,7 @@ void MVETailPredication::RematerializeIterCount() {
   ReplaceExitVal ReplaceExitValue = AlwaysRepl;
 
   formLCSSARecursively(*L, *DT, LI, SE);
-  rewriteLoopExitValues(L, LI, TLI, SE, Rewriter, DT, ReplaceExitValue,
+  rewriteLoopExitValues(L, LI, TLI, SE, TTI, Rewriter, DT, ReplaceExitValue,
                         DeadInsts);
 }
 
@@ -148,6 +183,7 @@ bool MVETailPredication::runOnLoop(Loop *L, LPPassManager&) {
   if (skipLoop(L) || DisableTailPredication)
     return false;
 
+  MaskedInsts.clear();
   Function &F = *L->getHeader()->getParent();
   auto &TPC = getAnalysis<TargetPassConfig>();
   auto &TM = TPC.getTM<TargetMachine>();
@@ -212,6 +248,7 @@ bool MVETailPredication::runOnLoop(Loop *L, LPPassManager&) {
   if (!Decrement)
     return false;
 
+  ClonedVCTPInExitBlock = false;
   LLVM_DEBUG(dbgs() << "ARM TP: Running on Loop: " << *L << *Setup << "\n"
              << *Decrement << "\n");
 
@@ -221,71 +258,39 @@ bool MVETailPredication::runOnLoop(Loop *L, LPPassManager&) {
     return true;
   }
 
+  LLVM_DEBUG(dbgs() << "ARM TP: Can't tail-predicate this loop.\n");
   return false;
 }
 
-bool MVETailPredication::isTailPredicate(Instruction *I, Value *NumElements) {
-  // Look for the following:
+// Pattern match predicates/masks and determine if they use the loop induction
+// variable to control the number of elements processed by the loop. If so,
+// the loop is a candidate for tail-predication.
+bool MVETailPredication::isTailPredicate(TripCountPattern &TCP) {
+  using namespace PatternMatch;
 
-  // %trip.count.minus.1 = add i32 %N, -1
-  // %broadcast.splatinsert10 = insertelement <4 x i32> undef,
-  //                                          i32 %trip.count.minus.1, i32 0
-  // %broadcast.splat11 = shufflevector <4 x i32> %broadcast.splatinsert10,
-  //                                    <4 x i32> undef,
-  //                                    <4 x i32> zeroinitializer
-  // ...
-  // ...
+  // Pattern match the loop body and find the add with takes the index iv
+  // and adds a constant vector to it:
+  //
+  // vector.body:
+  // ..
   // %index = phi i32
   // %broadcast.splatinsert = insertelement <4 x i32> undef, i32 %index, i32 0
   // %broadcast.splat = shufflevector <4 x i32> %broadcast.splatinsert,
   //                                  <4 x i32> undef,
   //                                  <4 x i32> zeroinitializer
-  // %induction = add <4 x i32> %broadcast.splat, <i32 0, i32 1, i32 2, i32 3>
+  // %induction = [add|or] <4 x i32> %broadcast.splat, <i32 0, i32 1, i32 2, i32 3>
   // %pred = icmp ule <4 x i32> %induction, %broadcast.splat11
-
-  // And return whether V == %pred.
-
-  using namespace PatternMatch;
-
-  CmpInst::Predicate Pred;
-  Instruction *Shuffle = nullptr;
-  Instruction *Induction = nullptr;
-
-  // The vector icmp
-  if (!match(I, m_ICmp(Pred, m_Instruction(Induction),
-                       m_Instruction(Shuffle))) ||
-      Pred != ICmpInst::ICMP_ULE)
-    return false;
-
-  // First find the stuff outside the loop which is setting up the limit
-  // vector....
-  // The invariant shuffle that broadcast the limit into a vector.
-  Instruction *Insert = nullptr;
-  if (!match(Shuffle, m_ShuffleVector(m_Instruction(Insert), m_Undef(),
-                                      m_Zero())))
-    return false;
-
-  // Insert the limit into a vector.
-  Instruction *BECount = nullptr;
-  if (!match(Insert, m_InsertElement(m_Undef(), m_Instruction(BECount),
-                                     m_Zero())))
-    return false;
-
-  // The limit calculation, backedge count.
-  Value *TripCount = nullptr;
-  if (!match(BECount, m_Add(m_Value(TripCount), m_AllOnes())))
-    return false;
-
-  if (TripCount != NumElements || !L->isLoopInvariant(BECount))
-    return false;
-
-  // Now back to searching inside the loop body...
-  // Find the add with takes the index iv and adds a constant vector to it.
+  //
+  // Please note that the 'or' is equivalent to the 'and' here, this relies on
+  // BroadcastSplat being the IV which we know is a phi with 0 start and Lanes
+  // increment, which is all being checked below.
   Instruction *BroadcastSplat = nullptr;
   Constant *Const = nullptr;
-  if (!match(Induction, m_Add(m_Instruction(BroadcastSplat),
-                              m_Constant(Const))))
-   return false;
+  if (!match(TCP.Induction,
+             m_Add(m_Instruction(BroadcastSplat), m_Constant(Const))) &&
+      !match(TCP.Induction,
+             m_Or(m_Instruction(BroadcastSplat), m_Constant(Const))))
+    return false;
 
   // Check that we're adding <0, 1, 2, 3...
   if (auto *CDS = dyn_cast<ConstantDataSequential>(Const)) {
@@ -296,14 +301,15 @@ bool MVETailPredication::isTailPredicate(Instruction *I, Value *NumElements) {
   } else
     return false;
 
+  Instruction *Insert = nullptr;
   // The shuffle which broadcasts the index iv into a vector.
-  if (!match(BroadcastSplat, m_ShuffleVector(m_Instruction(Insert), m_Undef(),
-                                             m_Zero())))
+  if (!match(BroadcastSplat,
+             m_Shuffle(m_Instruction(Insert), m_Undef(), m_ZeroMask())))
     return false;
 
   // The insert element which initialises a vector with the index iv.
   Instruction *IV = nullptr;
-  if (!match(Insert, m_InsertElement(m_Undef(), m_Instruction(IV), m_Zero())))
+  if (!match(Insert, m_InsertElt(m_Undef(), m_Instruction(IV), m_Zero())))
     return false;
 
   // The index iv.
@@ -317,7 +323,7 @@ bool MVETailPredication::isTailPredicate(Instruction *I, Value *NumElements) {
     return false;
 
   Value *InLoop = Phi->getIncomingValueForBlock(L->getLoopLatch());
-  unsigned Lanes = cast<VectorType>(Insert->getType())->getNumElements();
+  unsigned Lanes = cast<FixedVectorType>(Insert->getType())->getNumElements();
 
   Instruction *LHS = nullptr;
   if (!match(InLoop, m_Add(m_Instruction(LHS), m_SpecificInt(Lanes))))
@@ -326,10 +332,10 @@ bool MVETailPredication::isTailPredicate(Instruction *I, Value *NumElements) {
   return LHS == Phi;
 }
 
-static VectorType* getVectorType(IntrinsicInst *I) {
+static FixedVectorType *getVectorType(IntrinsicInst *I) {
   unsigned TypeOp = I->getIntrinsicID() == Intrinsic::masked_load ? 0 : 1;
   auto *PtrTy = cast<PointerType>(I->getOperand(TypeOp)->getType());
-  return cast<VectorType>(PtrTy->getElementType());
+  return cast<FixedVectorType>(PtrTy->getElementType());
 }
 
 bool MVETailPredication::IsPredicatedVectorLoop() {
@@ -339,7 +345,7 @@ bool MVETailPredication::IsPredicatedVectorLoop() {
   for (auto *BB : L->getBlocks()) {
     for (auto &I : *BB) {
       if (IsMasked(&I)) {
-        VectorType *VecTy = getVectorType(cast<IntrinsicInst>(&I));
+        FixedVectorType *VecTy = getVectorType(cast<IntrinsicInst>(&I));
         unsigned Lanes = VecTy->getNumElements();
         unsigned ElementWidth = VecTy->getScalarSizeInBits();
         // MVE vectors are 128-bit, but don't support 128 x i1.
@@ -349,6 +355,8 @@ bool MVETailPredication::IsPredicatedVectorLoop() {
           return false;
         MaskedInsts.push_back(cast<IntrinsicInst>(&I));
       } else if (auto *Int = dyn_cast<IntrinsicInst>(&I)) {
+        if (Int->getIntrinsicID() == Intrinsic::fma)
+          continue;
         for (auto &U : Int->args()) {
           if (isa<VectorType>(U->getType()))
             return false;
@@ -360,17 +368,108 @@ bool MVETailPredication::IsPredicatedVectorLoop() {
   return !MaskedInsts.empty();
 }
 
-Value* MVETailPredication::ComputeElements(Value *TripCount,
-                                           VectorType *VecTy) {
-  const SCEV *TripCountSE = SE->getSCEV(TripCount);
-  ConstantInt *VF = ConstantInt::get(cast<IntegerType>(TripCount->getType()),
-                                     VecTy->getNumElements());
+// Pattern match the predicate, which is an icmp with a constant vector of this
+// form:
+//
+//   icmp ult <4 x i32> %induction, <i32 32002, i32 32002, i32 32002, i32 32002>
+//
+// and return the constant, i.e. 32002 in this example. This is assumed to be
+// the scalar loop iteration count: the number of loop elements by the
+// the vector loop. Further checks are performed in function isTailPredicate(),
+// to verify 'induction' behaves as an induction variable.
+//
+static bool ComputeConstElements(TripCountPattern &TCP) {
+  if (!dyn_cast<ConstantInt>(TCP.TripCount))
+    return false;
+
+  ConstantInt *VF = ConstantInt::get(
+      cast<IntegerType>(TCP.TripCount->getType()), TCP.VecTy->getNumElements());
+  using namespace PatternMatch;
+  CmpInst::Predicate CC;
+
+  if (!match(TCP.Predicate, m_ICmp(CC, m_Instruction(TCP.Induction),
+                                   m_AnyIntegralConstant())) ||
+      CC != ICmpInst::ICMP_ULT)
+    return false;
+
+  LLVM_DEBUG(dbgs() << "ARM TP: icmp with constants: "; TCP.Predicate->dump(););
+  Value *ConstVec = TCP.Predicate->getOperand(1);
+
+  auto *CDS = dyn_cast<ConstantDataSequential>(ConstVec);
+  if (!CDS || CDS->getNumElements() != VF->getSExtValue())
+    return false;
+
+  if ((TCP.NumElements = CDS->getSplatValue())) {
+    assert(dyn_cast<ConstantInt>(TCP.NumElements)->getSExtValue() %
+                   VF->getSExtValue() !=
+               0 &&
+           "tail-predication: trip count should not be a multiple of the VF");
+    LLVM_DEBUG(dbgs() << "ARM TP: Found const elem count: " << *TCP.NumElements
+                      << "\n");
+    return true;
+  }
+  return false;
+}
+
+// Pattern match the loop iteration count setup:
+//
+// %trip.count.minus.1 = add i32 %N, -1
+// %broadcast.splatinsert10 = insertelement <4 x i32> undef,
+//                                          i32 %trip.count.minus.1, i32 0
+// %broadcast.splat11 = shufflevector <4 x i32> %broadcast.splatinsert10,
+//                                    <4 x i32> undef,
+//                                    <4 x i32> zeroinitializer
+// ..
+// vector.body:
+// ..
+//
+static bool MatchElemCountLoopSetup(Loop *L, Instruction *Shuffle,
+                                    Value *NumElements) {
+  using namespace PatternMatch;
+  Instruction *Insert = nullptr;
+
+  if (!match(Shuffle,
+             m_Shuffle(m_Instruction(Insert), m_Undef(), m_ZeroMask())))
+    return false;
+
+  // Insert the limit into a vector.
+  Instruction *BECount = nullptr;
+  if (!match(Insert,
+             m_InsertElt(m_Undef(), m_Instruction(BECount), m_Zero())))
+    return false;
+
+  // The limit calculation, backedge count.
+  Value *TripCount = nullptr;
+  if (!match(BECount, m_Add(m_Value(TripCount), m_AllOnes())))
+    return false;
+
+  if (TripCount != NumElements || !L->isLoopInvariant(BECount))
+    return false;
+
+  return true;
+}
+
+bool MVETailPredication::ComputeRuntimeElements(TripCountPattern &TCP) {
+  using namespace PatternMatch;
+  const SCEV *TripCountSE = SE->getSCEV(TCP.TripCount);
+  ConstantInt *VF = ConstantInt::get(
+      cast<IntegerType>(TCP.TripCount->getType()), TCP.VecTy->getNumElements());
 
   if (VF->equalsInt(1))
-    return nullptr;
+    return false;
 
-  // TODO: Support constant trip counts.
-  auto VisitAdd = [&](const SCEVAddExpr *S) -> const SCEVMulExpr* {
+  CmpInst::Predicate Pred;
+  if (!match(TCP.Predicate, m_ICmp(Pred, m_Instruction(TCP.Induction),
+                                   m_Instruction(TCP.Shuffle))) ||
+      Pred != ICmpInst::ICMP_ULE)
+    return false;
+
+  LLVM_DEBUG(dbgs() << "Computing number of elements for vector trip count: ";
+             TCP.TripCount->dump());
+
+  // Otherwise, continue and try to pattern match the vector iteration
+  // count expression
+  auto VisitAdd = [&](const SCEVAddExpr *S) -> const SCEVMulExpr * {
     if (auto *Const = dyn_cast<SCEVConstant>(S->getOperand(0))) {
       if (Const->getAPInt() != -VF->getValue())
         return nullptr;
@@ -379,7 +478,7 @@ Value* MVETailPredication::ComputeElements(Value *TripCount,
     return dyn_cast<SCEVMulExpr>(S->getOperand(1));
   };
 
-  auto VisitMul = [&](const SCEVMulExpr *S) -> const SCEVUDivExpr* {
+  auto VisitMul = [&](const SCEVMulExpr *S) -> const SCEVUDivExpr * {
     if (auto *Const = dyn_cast<SCEVConstant>(S->getOperand(0))) {
       if (Const->getValue() != VF)
         return nullptr;
@@ -388,7 +487,7 @@ Value* MVETailPredication::ComputeElements(Value *TripCount,
     return dyn_cast<SCEVUDivExpr>(S->getOperand(1));
   };
 
-  auto VisitDiv = [&](const SCEVUDivExpr *S) -> const SCEV* {
+  auto VisitDiv = [&](const SCEVUDivExpr *S) -> const SCEV * {
     if (auto *Const = dyn_cast<SCEVConstant>(S->getRHS())) {
       if (Const->getValue() != VF)
         return nullptr;
@@ -425,15 +524,20 @@ Value* MVETailPredication::ComputeElements(Value *TripCount,
               Elems = Res;
 
   if (!Elems)
-    return nullptr;
+    return false;
 
   Instruction *InsertPt = L->getLoopPreheader()->getTerminator();
   if (!isSafeToExpandAt(Elems, InsertPt, *SE))
-    return nullptr;
+    return false;
 
   auto DL = L->getHeader()->getModule()->getDataLayout();
   SCEVExpander Expander(*SE, DL, "elements");
-  return Expander.expandCodeFor(Elems, Elems->getType(), InsertPt);
+  TCP.NumElements = Expander.expandCodeFor(Elems, Elems->getType(), InsertPt);
+
+  if (!MatchElemCountLoopSetup(L, TCP.Shuffle, TCP.NumElements))
+    return false;
+
+  return true;
 }
 
 // Look through the exit block to see whether there's a duplicate predicate
@@ -479,10 +583,10 @@ static bool Cleanup(DenseMap<Instruction*, Instruction*> &NewPredicates,
     if (I->hasNUsesOrMore(1))
       continue;
 
-    for (auto &U : I->operands()) {
+    for (auto &U : I->operands())
       if (auto *OpI = dyn_cast<Instruction>(U))
         MaybeDead.insert(OpI);
-    }
+
     I->dropAllReferences();
     Dead.insert(I);
   }
@@ -498,24 +602,23 @@ static bool Cleanup(DenseMap<Instruction*, Instruction*> &NewPredicates,
   return ClonedVCTPInExitBlock;
 }
 
-void MVETailPredication::InsertVCTPIntrinsic(Instruction *Predicate,
-    DenseMap<Instruction*, Instruction*> &NewPredicates,
-    VectorType *VecTy, Value *NumElements) {
+void MVETailPredication::InsertVCTPIntrinsic(TripCountPattern &TCP,
+    DenseMap<Instruction*, Instruction*> &NewPredicates) {
   IRBuilder<> Builder(L->getHeader()->getFirstNonPHI());
   Module *M = L->getHeader()->getModule();
   Type *Ty = IntegerType::get(M->getContext(), 32);
 
   // Insert a phi to count the number of elements processed by the loop.
   PHINode *Processed = Builder.CreatePHI(Ty, 2);
-  Processed->addIncoming(NumElements, L->getLoopPreheader());
+  Processed->addIncoming(TCP.NumElements, L->getLoopPreheader());
 
   // Insert the intrinsic to represent the effect of tail predication.
-  Builder.SetInsertPoint(cast<Instruction>(Predicate));
+  Builder.SetInsertPoint(cast<Instruction>(TCP.Predicate));
   ConstantInt *Factor =
-    ConstantInt::get(cast<IntegerType>(Ty), VecTy->getNumElements());
+    ConstantInt::get(cast<IntegerType>(Ty), TCP.VecTy->getNumElements());
 
   Intrinsic::ID VCTPID;
-  switch (VecTy->getNumElements()) {
+  switch (TCP.VecTy->getNumElements()) {
   default:
     llvm_unreachable("unexpected number of lanes");
   case 4:  VCTPID = Intrinsic::arm_mve_vctp32; break;
@@ -530,8 +633,8 @@ void MVETailPredication::InsertVCTPIntrinsic(Instruction *Predicate,
   }
   Function *VCTP = Intrinsic::getDeclaration(M, VCTPID);
   Value *TailPredicate = Builder.CreateCall(VCTP, Processed);
-  Predicate->replaceAllUsesWith(TailPredicate);
-  NewPredicates[Predicate] = cast<Instruction>(TailPredicate);
+  TCP.Predicate->replaceAllUsesWith(TailPredicate);
+  NewPredicates[TCP.Predicate] = cast<Instruction>(TailPredicate);
 
   // Add the incoming value to the new phi.
   // TODO: This add likely already exists in the loop.
@@ -544,7 +647,7 @@ void MVETailPredication::InsertVCTPIntrinsic(Instruction *Predicate,
 
 bool MVETailPredication::TryConvert(Value *TripCount) {
   if (!IsPredicatedVectorLoop()) {
-    LLVM_DEBUG(dbgs() << "ARM TP: no masked instructions in loop");
+    LLVM_DEBUG(dbgs() << "ARM TP: no masked instructions in loop.\n");
     return false;
   }
 
@@ -555,27 +658,46 @@ bool MVETailPredication::TryConvert(Value *TripCount) {
   SetVector<Instruction*> Predicates;
   DenseMap<Instruction*, Instruction*> NewPredicates;
 
+#ifndef NDEBUG
+  // For debugging purposes, use this to indicate we have been able to
+  // pattern match the scalar loop trip count.
+  bool FoundScalarTC = false;
+#endif
+
   for (auto *I : MaskedInsts) {
     Intrinsic::ID ID = I->getIntrinsicID();
+    // First, find the icmp used by this masked load/store.
     unsigned PredOp = ID == Intrinsic::masked_load ? 2 : 3;
     auto *Predicate = dyn_cast<Instruction>(I->getArgOperand(PredOp));
     if (!Predicate || Predicates.count(Predicate))
       continue;
 
-    VectorType *VecTy = getVectorType(I);
-    Value *NumElements = ComputeElements(TripCount, VecTy);
-    if (!NumElements)
+    // Step 1: using this icmp, now calculate the number of elements
+    // processed by this loop.
+    TripCountPattern TCP(Predicate, TripCount, getVectorType(I));
+    if (!(ComputeConstElements(TCP) || ComputeRuntimeElements(TCP)))
       continue;
 
-    if (!isTailPredicate(Predicate, NumElements)) {
-      LLVM_DEBUG(dbgs() << "ARM TP: Not tail predicate: " << *Predicate << "\n");
+    LLVM_DEBUG(FoundScalarTC = true);
+
+    if (!isTailPredicate(TCP)) {
+      LLVM_DEBUG(dbgs() << "ARM TP: Not an icmp that generates tail predicate: "
+                        << *Predicate << "\n");
       continue;
     }
 
-    LLVM_DEBUG(dbgs() << "ARM TP: Found tail predicate: " << *Predicate << "\n");
+    LLVM_DEBUG(dbgs() << "ARM TP: Found icmp generating tail predicate: "
+                      << *Predicate << "\n");
     Predicates.insert(Predicate);
 
-    InsertVCTPIntrinsic(Predicate, NewPredicates, VecTy, NumElements);
+    // Step 2: emit the VCTP intrinsic representing the effect of TP.
+    InsertVCTPIntrinsic(TCP, NewPredicates);
+  }
+
+  if (!NewPredicates.size()) {
+      LLVM_DEBUG(if (!FoundScalarTC)
+                   dbgs() << "ARM TP: Can't determine loop itertion count\n");
+    return false;
   }
 
   // Now clean up.

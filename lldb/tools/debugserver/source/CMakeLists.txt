@@ -82,6 +82,8 @@ endif ()
 
 check_library_exists(compression compression_encode_buffer "" HAVE_LIBCOMPRESSION)
 
+find_library(SECURITY_LIBRARY Security)
+
 add_subdirectory(MacOSX)
 
 set(LLDB_CODESIGN_IDENTITY "" CACHE STRING
@@ -127,6 +129,14 @@ if(LLDB_USE_ENTITLEMENTS)
   endif()
 endif()
 
+if($ENV{SDKROOT} MATCHES ".Internal.sdk$")
+  message(STATUS "LLDB debugserver energy support is enabled")
+  add_definitions(-DLLDB_ENERGY)
+  set(ENERGY_LIBRARY -lpmenergy -lpmsample)
+else()
+  message(STATUS "LLDB debugserver energy support is disabled")
+endif()
+
 set(generated_mach_interfaces
   ${CMAKE_CURRENT_BINARY_DIR}/mach_exc.h
   ${CMAKE_CURRENT_BINARY_DIR}/mach_excServer.c
@@ -134,9 +144,11 @@ set(generated_mach_interfaces
   )
 
 set(MIG_ARCH_FLAGS "")
-foreach(ARCH ${CMAKE_OSX_ARCHITECTURES})
-  set(MIG_ARCH_FLAGS "${MIG_ARCH_FLAGS} -arch ${ARCH}")
-endforeach()
+if (DEFINED MIG_ARCHS)
+  foreach(ARCH ${MIG_ARCHS})
+    set(MIG_ARCH_FLAGS "${MIG_ARCH_FLAGS} -arch ${ARCH}")
+  endforeach()
+endif()
 separate_arguments(MIG_ARCH_FLAGS_SEPARTED NATIVE_COMMAND "${MIG_ARCH_FLAGS}")
 
 add_custom_command(OUTPUT ${generated_mach_interfaces}
@@ -202,7 +214,10 @@ target_link_libraries(lldbDebugserverCommon
                       ${LOCKDOWN_LIBRARY}
                       lldbDebugserverArchSupport
                       lldbDebugserverDarwin_DarwinLog
-                      ${LIBCOMPRESSION})
+                      ${FOUNDATION_LIBRARY}
+                      ${SECURITY_LIBRARY}
+                      ${LIBCOMPRESSION}
+                      ${ENERGY_LIBRARY})
 if(HAVE_LIBCOMPRESSION)
   set_property(TARGET lldbDebugserverCommon APPEND PROPERTY
                 COMPILE_DEFINITIONS HAVE_LIBCOMPRESSION)
@@ -265,6 +280,7 @@ if(IOS)
                       ${FOUNDATION_LIBRARY}
                       lldbDebugserverArchSupport
                       lldbDebugserverDarwin_DarwinLog
+                      ${SECURITY_LIBRARY}
                       ${LIBCOMPRESSION})
   if(HAVE_LIBCOMPRESSION)
     set_property(TARGET lldbDebugserverCommon_NonUI APPEND PROPERTY

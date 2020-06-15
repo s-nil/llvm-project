@@ -14,20 +14,19 @@
 #define LLVM_CODEGEN_PSEUDOSOURCEVALUE_H
 
 #include "llvm/ADT/StringMap.h"
-#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/ValueMap.h"
 #include <map>
 
 namespace llvm {
 
+class GlobalValue;
 class MachineFrameInfo;
 class MachineMemOperand;
 class MIRFormatter;
+class PseudoSourceValue;
 class raw_ostream;
 class TargetInstrInfo;
 
-raw_ostream &operator<<(raw_ostream &OS, const MachineMemOperand &MMO);
-class PseudoSourceValue;
 raw_ostream &operator<<(raw_ostream &OS, const PseudoSourceValue* PSV);
 
 /// Special value supplied for machine level alias analysis. It indicates that
@@ -93,7 +92,7 @@ public:
 /// A specialized PseudoSourceValue for holding FixedStack values, which must
 /// include a frame index.
 class FixedStackPseudoSourceValue : public PseudoSourceValue {
-  int FI;
+  const int FI;
 
 public:
   explicit FixedStackPseudoSourceValue(int FI, const TargetInstrInfo &TII)
@@ -112,7 +111,6 @@ public:
   void printCustom(raw_ostream &OS) const override;
 
   int getFrameIndex() const { return FI; }
-  void setFrameIndex(int FI) { this->FI = FI; }
 };
 
 class CallEntryPseudoSourceValue : public PseudoSourceValue {

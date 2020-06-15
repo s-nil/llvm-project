@@ -362,6 +362,16 @@ def Rol: pf2<rotl>;
 // --(1) Immediate -------------------------------------------------------
 //
 
+def Imm64Lo: SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(int32_t (N->getSExtValue()),
+                                   SDLoc(N), MVT::i32);
+}]>;
+def Imm64Hi: SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(int32_t (N->getSExtValue()>>32),
+                                   SDLoc(N), MVT::i32);
+}]>;
+
+
 def SDTHexagonCONST32
   : SDTypeProfile<1, 1, [SDTCisVT<0, i32>, SDTCisVT<1, i32>, SDTCisPtrTy<0>]>;
 
@@ -389,7 +399,10 @@ def: Pat<(HexagonCP         tconstpool:$A),     (A2_tfrsi imm:$A)>;
 
 def: Pat<(i1 0),        (PS_false)>;
 def: Pat<(i1 1),        (PS_true)>;
-def: Pat<(i64 imm:$v),  (CONST64 imm:$v)>;
+def: Pat<(i64 imm:$v),  (CONST64 imm:$v)>,
+     Requires<[UseSmallData,NotOptTinyCore]>;
+def: Pat<(i64 imm:$v),
+         (Combinew (A2_tfrsi (Imm64Hi $v)), (A2_tfrsi (Imm64Lo $v)))>;
 
 def ftoi : SDNodeXForm<fpimm, [{
   APInt I = N->getValueAPF().bitcastToAPInt();
@@ -1082,7 +1095,7 @@ def Divu64_8: SDNodeXForm<imm, [{
 // Special cases:
 let AddedComplexity = 100 in {
   def: Pat<(fshl I32:$Rs, I32:$Rt, (i32 16)),
-           (A2_combine_hl I32:$Rs, I32:$Rt)>;
+           (A2_combine_lh I32:$Rs, I32:$Rt)>;
   def: Pat<(fshl I64:$Rs, I64:$Rt, IsMul8_U3:$S),
            (S2_valignib I64:$Rs, I64:$Rt, (Divu64_8 $S))>;
 }
@@ -1116,7 +1129,7 @@ def FShr64r: OutPatFrag<(ops node:$Rs, node:$Rt, node:$Ru),
 // Special cases:
 let AddedComplexity = 100 in {
   def: Pat<(fshr I32:$Rs, I32:$Rt, (i32 16)),
-           (A2_combine_hl I32:$Rs, I32:$Rt)>;
+           (A2_combine_lh I32:$Rs, I32:$Rt)>;
   def: Pat<(fshr I64:$Rs, I64:$Rt, IsMul8_U3:$S),
            (S2_valignib I64:$Rs, I64:$Rt, (Divu8 $S))>;
 }

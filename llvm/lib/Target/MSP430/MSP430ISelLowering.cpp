@@ -514,7 +514,7 @@ static void AnalyzeArguments(CCState &State,
 
     // Handle byval arguments
     if (ArgFlags.isByVal()) {
-      State.HandleByVal(ValNo++, ArgVT, LocVT, LocInfo, 2, 2, ArgFlags);
+      State.HandleByVal(ValNo++, ArgVT, LocVT, LocInfo, 2, Align(2), ArgFlags);
       continue;
     }
 
@@ -863,13 +863,11 @@ SDValue MSP430TargetLowering::LowerCCCCallTo(
 
       if (Flags.isByVal()) {
         SDValue SizeNode = DAG.getConstant(Flags.getByValSize(), dl, MVT::i16);
-        MemOp = DAG.getMemcpy(Chain, dl, PtrOff, Arg, SizeNode,
-                              Flags.getByValAlign(),
-                              /*isVolatile*/false,
-                              /*AlwaysInline=*/true,
-                              /*isTailCall=*/false,
-                              MachinePointerInfo(),
-                              MachinePointerInfo());
+        MemOp = DAG.getMemcpy(
+            Chain, dl, PtrOff, Arg, SizeNode, Flags.getNonZeroByValAlign(),
+            /*isVolatile*/ false,
+            /*AlwaysInline=*/true,
+            /*isTailCall=*/false, MachinePointerInfo(), MachinePointerInfo());
       } else {
         MemOp = DAG.getStore(Chain, dl, Arg, PtrOff, MachinePointerInfo());
       }
